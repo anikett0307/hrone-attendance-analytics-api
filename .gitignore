@@ -1,0 +1,12 @@
+@"
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+__pycache__/
+*.py[cod]
+Dockerfile
+docker-compose.yml
+docker-compose.yaml
+"@ | Set-Content .gitignore
