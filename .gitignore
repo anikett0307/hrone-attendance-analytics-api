@@ -10,3 +10,10 @@ Dockerfile
 docker-compose.yml
 docker-compose.yaml
 "@ | Set-Content .gitignore
+DATA_MODEL.md
+PROBLEM_STATEMENT.docx
+openapi.yaml
+sample_data/
+sample_seed.py
+test_explain.py
+test_concurrency.py

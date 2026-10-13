@@ -72,3 +72,4 @@ Optional: load the 9 sample documents with `python sample_seed.py`.
 - No authentication (the `regularized_by` value is free text, as the assignment specifies).
 - Tested manually through Swagger and a small explain-check script. There is no automated test suite.
 - Explain output was checked on a small dataset, not on the full 100,000-record dataset.
+- Tested manually through Swagger and a small explain-check script. There is no automated test suite.
