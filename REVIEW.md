@@ -1,41 +1,33 @@
 # REVIEW.md
 
-Review of the starter `app/main.py` (helpers and endpoints).
-
 ## Defects found
 
-| # | Where (function / line) | What is wrong | How you'd notice it (test, input, or symptom) | How you fixed it |
+| # | Where | What is wrong | How I'd notice it | How I fixed it |
 |---|---|---|---|---|
-| 1 | `health` | Always returned `{"status": "ok"}` without contacting MongoDB. | Stop MongoDB and call `GET /health`: it still returned 200. | Runs a `ping` command and returns 503 if MongoDB does not answer. |
-| 2 | Startup (no indexes at all) | No unique index on `emp_code` or on `(emp_code, date)`, and no indexes for listing or analytics. Duplicates were possible, and queries scan the whole collection. | Send two identical `POST /employees` or `POST /attendance/punch-in` requests at the same moment: both could succeed. Explain output shows `COLLSCAN`. | `create_indexes` runs at startup (idempotent): unique `emp_code`, unique `(emp_code, date)`, plus `(date desc, emp_code)`, `(status, date desc, emp_code)`, `(emp_code, punch_in desc)`, `(department, joined_on)`, `(department, emp_code)` and `joined_on`. |
-| 3 | `create_employee` | Check-then-insert race: two simultaneous requests could both pass `find_one`. | Concurrent `POST /employees` with the same `emp_code`. | The unique index is the real guard. `DuplicateKeyError` is caught and returns 409. The `find_one` pre-check is only a fast path. |
-| 4 | `EmployeeIn` | No validation at all: any `emp_code`, email, shift string or `joined_on` was accepted, including `shift_start == shift_end`. | `POST /employees` with `"joined_on": "2026-13-45"`, `"shift_start": "99:99"`, or a bad email. | Pydantic patterns for `emp_code` (`EMP` + 4-6 digits), email, `HH:MM` shifts and a length limit on name, email and department. A validator parses `joined_on` as a real date. Equal shift times return 422. |
-| 5 | `create_employee` (`created_at`) | Used naive local time `datetime.now()` and returned a datetime object instead of epoch milliseconds. | Compare `created_at` in the response with the server clock. | Stored as UTC-aware datetime. The response returns integer epoch milliseconds. |
-| 6 | `list_employees` (skip) | `skip = page * page_size` skipped the whole first page, so page 1 never showed the first employees. | Create 3 employees and call `GET /employees?page=1&page_size=2`: the first 2 were missing. | `skip = (page - 1) * page_size`. |
-| 7 | `list_employees` (total) | `total` was `count_documents({})`, ignoring the department filter. | `GET /employees?department=X`: `total` equals the whole collection. | `total` counts the same filter as the query. |
-| 8 | `list_employees` (sort, validation, output) | No sort, so pages were unstable. `page` and `page_size` were not validated (0, negative, huge). `created_at` was returned as a raw datetime. | `?page=0`, `?page_size=100000`, or compare two pages. | Sorted by `emp_code` ascending. `page >= 1` and `1 <= page_size <= 100` return 422 otherwise. `created_at` converted to epoch ms (naive datetimes treated as UTC). |
-| 9 | `punch_in` (timestamp) | `datetime.fromtimestamp(ms / 1000)` used the server's local time zone and kept microseconds, so the attendance date and late calculation depended on the machine's time zone. `if body.punched_at` also treated `0` as "missing". | Run the server in a non-IST zone and punch in at 00:30 IST. The date was wrong. | The instant is converted to IST and truncated to whole seconds (R1). A missing value is checked with `is not None`. |
-| 10 | `PunchInIn` | `punched_at: Optional[int]` accepted seconds-looking values, negatives, floats and numeric strings. `status` was any string. | `punched_at: 1783226100` (seconds), `1.5`, `"123"`, or `status: "BANANA"`. | `StrictInt` with range 100000000000 to 4102444800000, and `status` is restricted to `PRESENT`, `WFH`, `ON_DUTY`. Anything else returns 422. |
-| 11 | `punch_in` (unknown employee) | `emp` was not checked for `None`, so `emp["shift_start"]` raised a TypeError and returned 500. | `POST /attendance/punch-in` with an unknown `emp_code`. | Returns 404 `employee not found`. |
-| 12 | `punch_in` (overnight shift) | The date was always the calendar date of the punch. An overnight shift punched in after midnight (before `shift_end`) was assigned to the wrong day. | Employee on 22:00-06:00 punches in at 02:00: the record was dated the next day. | If `shift_end <= shift_start` and the IST punch time is earlier than `shift_end`, the attendance date is the previous day (R1). |
-| 13 | `punch_in` (duplicate race) | Check-then-insert with no unique index. | Two simultaneous identical punch-ins both returned 201. | The unique `(emp_code, date)` index decides. `DuplicateKeyError` returns 409, so exactly one request succeeds. |
-| 14 | `compute_late_minutes` | Floored the minutes first and then tested `> 10`, so 09:40:30 (10 min 30 s) counted as on time. It also assumed the shift start was on the punch-in's own calendar day. | Shift 09:30, punch-in 09:40:01. Expected 10 late minutes, starter returned 0. A punch-in 13 hours after shift start was also mishandled. | Compares the exact seconds to 600 (strictly greater, R2) and measures from the shift start on the record's attendance date. Returns whole minutes (floor). |
-| 15 | `compute_work_hours` | Used Python `round()` on a float, which is banker's rounding and subject to float error. | 4.505 hours (16218 s) rounds to 4.5 instead of 4.51. | Uses `Decimal` with `ROUND_HALF_UP` to 2 decimals (R4). |
-| 16 | `compute_overtime` | Had no 30-minute minimum, ignored overnight shifts (end on the next day) and the signature did not receive `shift_start`. Subtracting a naive `punch_out` from an aware `end` raised TypeError. | Punch out 10 minutes after shift end: starter returned 10, expected 0. | Rewritten: overtime is the whole minutes after shift end (next day for overnight shifts), counted only when at least 30 (R3). Naive datetimes are treated as UTC and converted to IST. |
-| 17 | `punch_in` (response) | Returned `id` (the stringified `_id`) and raw datetimes. | `POST /attendance/punch-in` and look at the JSON. | `_id` is removed and times are epoch milliseconds, through a shared `serialize_record` helper. |
-| 18 | `list_attendance` (performance) | Loaded the whole collection with `find(q)` and sorted and paginated in Python. | Slow, memory-heavy on 100k records. | Sort, skip and limit are done in MongoDB with `.sort().skip().limit()`, backed by indexes. |
-| 19 | `list_attendance` (ordering) | Sorted by `date` only, so ties had no stable order. | Two records on the same date could swap between pages. | Sort is `date` descending, then `emp_code` ascending. |
-| 20 | `list_attendance` (validation) | `date_from`, `date_to`, `status`, `page` and `page_size` were not validated. `date_from > date_to` was accepted. | `?date_from=2026-13-45`, `?status=BOGUS`, `?page=0`, `?date_from=2026-07-10&date_to=2026-07-01`. | Dates must be real calendar dates, `status` is restricted to the five valid values, `page >= 1`, `page_size` 1 to 100, and `date_from > date_to` returns 422. |
-| 21 | `list_attendance` (output) | Returned `id` and raw BSON datetimes. Legacy records without `half_day`, `history`, `late_minutes` or `overtime_minutes` were returned without them. | List a legacy record such as sample document 9. | Every record goes through `serialize_record`: no `_id`, epoch milliseconds (including inside `history`), and defaults for missing fields. |
-| 22 | Missing endpoints | `POST /attendance/punch-out`, `PATCH /attendance/{emp_code}/{date}`, the four analytics endpoints and `/admin/explain/{endpoint}` did not exist. | Open Swagger: they are missing. | All were built as specified. Punch-out and PATCH use conditional atomic updates (punch-out only closes an open record, and PATCH only applies if `history` still has the same length). Analytics are MongoDB aggregation pipelines (`$lookup`, `$setWindowFields`, `$densify`). The explain endpoint runs `executionStats` on the same queries and pipelines. |
+| 1 | `/health` | Always said "ok" without checking MongoDB. | Stop MongoDB and call `/health`. It still returned 200. | It now pings MongoDB and returns 503 if that fails. |
+| 2 | Startup | There were no indexes, so duplicates were possible and queries scanned everything. | Two identical requests at once could both succeed. The explain output showed COLLSCAN. | Indexes are created at startup. Two of them are unique: `emp_code`, and `(emp_code, date)`. |
+| 3 | `POST /employees` | It checked first and then inserted, so two requests at the same moment could both pass. | Send the same `emp_code` twice at once. | The unique index decides, and a duplicate returns 409. |
+| 4 | `EmployeeIn` | Nothing was validated, so bad dates, bad times and bad emails went through. | `joined_on` = `2026-13-45`, or `shift_start` = `99:99`. | Added checks for the code, email, shift times and a real date. These return 422. |
+| 5 | `GET /employees` | The skip was `page * page_size`, so page 1 skipped the first employees. | Create 3 employees and ask for page 1 with size 2. | Changed to `(page - 1) * page_size`. |
+| 6 | `GET /employees` | `total` ignored the department filter, there was no sort, and `page` and `page_size` were not checked. | Filter by department and look at `total`. Try `page=0`. | Total uses the same filter, results are sorted by `emp_code`, and bad paging returns 422. |
+| 7 | `POST /attendance/punch-in` | It used the server's own time zone instead of IST, and kept microseconds. | Run the server in another time zone. The date came out wrong. | The time is converted to IST and cut to whole seconds. |
+| 8 | `PunchInIn` | It accepted seconds instead of milliseconds, floats, and any status. | `punched_at` = `1783311000`, or `status` = `BANANA`. | The timestamp must be a whole number in a valid range, and the status must be one of the allowed ones. |
+| 9 | `punch_in` | An unknown employee crashed with a 500. | Punch in with an `emp_code` that doesn't exist. | Returns 404. |
+| 10 | `punch_in` | Overnight shifts were put on the wrong date. | Shift 22:00 to 06:00, punch in at 02:00. | If the shift is overnight and the punch is before shift end, the date is the day before. |
+| 11 | `punch_in` | Same check-then-insert race as employees. | Two identical punch-ins at once. | The unique `(emp_code, date)` index lets one succeed and the rest get 409. |
+| 12 | `compute_late_minutes` | It floored the minutes before checking the 10-minute limit, so 10 min 1 sec counted as on time. It also got very late punch-ins wrong. | Shift 09:30, punch in at 09:40:01. | It compares exact seconds to 600 and measures from the shift start on the attendance date. |
+| 13 | `compute_work_hours` | Python `round()` on a float can round the wrong way. | A work time of exactly 4.495 hours. | Uses `Decimal` with half-up rounding. |
+| 14 | `compute_overtime` | There was no 30-minute minimum, overnight shifts were ignored, and it crashed on naive times. | Punch out 10 minutes after shift end returned 10 instead of 0. | Overtime counts only when it is at least 30 minutes, and handles overnight shifts. |
+| 15 | `GET /attendance` | It loaded every record into Python and sorted there. | Slow on 100k records. | Sorting and paging are done in MongoDB, using indexes. |
+| 16 | `GET /attendance` | Dates, status and paging were not validated, and it returned raw `_id`, raw datetimes and missing fields on old records. | `date_from` = `2026-13-45`, or an old record with no `history`. | Bad input returns 422. Every record is cleaned up, with times in milliseconds and defaults filled in. |
+| 17 | Missing endpoints | Punch-out, PATCH, the four analytics routes and explain did not exist. | They were missing from Swagger. | I built them all. Punch-out and PATCH use conditional updates so two requests can't both win. |
 
-## Looked at and decided NOT a defect
+## Checked and fine as it was
 
-| Item | Why it is correct |
+| Item | Why |
 |---|---|
-| Grace period idea in `compute_late_minutes` | The 10-minute threshold matches R2. Only the comparison and the shift-start calculation were wrong. |
-| Department filter in `list_employees` | An exact, case-sensitive match on `department`, as the contract states. |
-| `{"_id": 0}` projection in `list_employees` | `_id` was already hidden correctly for employees. |
-| Initial attendance document in `punch_in` | `punch_out`, `work_hours` = null, `overtime_minutes` = 0, `half_day` = false and `history` = [] already match DATA_MODEL.md. |
-| String comparison on `date` in `list_attendance` | ISO `YYYY-MM-DD` strings sort the same as dates, so `$gte` / `$lte` are inclusive and correct. |
-| Storing dates and shift times as strings | Required by DATA_MODEL.md. |
+| The 10-minute late limit | It matches the rule. Only the maths around it was wrong. |
+| Department filter on employees | It is an exact, case-sensitive match, like the contract says. |
+| New attendance document in `punch_in` | `punch_out`, `work_hours`, `overtime_minutes`, `half_day` and `history` already started with the right defaults. |
+| Comparing `date` as a string | `YYYY-MM-DD` sorts in date order, so `$gte` and `$lte` work. |
+| Dates and shift times stored as strings | The data model asks for this. |
